@@ -1,146 +1,176 @@
-import os
-import secrets
+"""Combined PDTB + UCREL classroom quiz.
+No password. SQLite is local to the Streamlit instance; use persistent shared DB for reliable cloud use.
+"""
 import sqlite3
-from datetime import datetime, timezone
-import pandas as pd
+import secrets
+import time
+from pathlib import Path
+
 import streamlit as st
 from questions import QUESTIONS
 
-st.set_page_config(page_title='PDTB Pair Challenge', page_icon='🏆', layout='wide')
-DB_PATH = os.getenv('PDTB_DB_PATH', 'pdtb_challenge.sqlite3')
-TEAM_LIMIT = 6
+DB = Path(__file__).with_name("challenge.sqlite3")
+st.set_page_config(page_title="PDTB + UCREL Pair Challenge", page_icon="📚", layout="wide")
 
-def conn():
-    c=sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    c.execute('PRAGMA journal_mode=WAL')
-    c.execute('PRAGMA busy_timeout=30000')
-    return c
+def connect():
+    con = sqlite3.connect(str(DB), timeout=20, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=20000")
+    return con
 
-def init():
-    with conn() as c:
-        c.execute('CREATE TABLE IF NOT EXISTS sessions(code TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS teams(code TEXT NOT NULL, name TEXT NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, answers TEXT NOT NULL DEFAULT "{}", PRIMARY KEY(code,name))')
-init()
+def initialize():
+    with connect() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            code TEXT PRIMARY KEY, topic TEXT NOT NULL, revealed INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS submissions (
+            code TEXT NOT NULL, team TEXT NOT NULL, answers TEXT NOT NULL,
+            submitted_at REAL NOT NULL, PRIMARY KEY(code, team))""")
+initialize()
 
-def session(code):
-    with conn() as c:
-        return c.execute('SELECT status FROM sessions WHERE code=?',(code,)).fetchone()
+def get_session(code):
+    with connect() as c:
+        return c.execute("SELECT * FROM sessions WHERE code=?", (code,)).fetchone()
 
-def teams(code):
-    with conn() as c:
-        return c.execute('SELECT name,submitted,answers FROM teams WHERE code=? ORDER BY name',(code,)).fetchall()
+def all_submissions(code):
+    with connect() as c:
+        return c.execute("SELECT * FROM submissions WHERE code=? ORDER BY submitted_at", (code,)).fetchall()
 
-def score(answer_map):
-    return sum(answer_map.get(str(i)) == q[3] for i,q in enumerate(QUESTIONS))
+def create_session(topic):
+    for _ in range(10):
+        code = secrets.token_hex(3).upper()
+        try:
+            with connect() as c:
+                c.execute("INSERT INTO sessions(code,topic,created_at) VALUES(?,?,?)",
+                          (code, topic, time.time()))
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError("Unable to generate unique session code")
 
-def store_answers(code,name,answer_map,submit=False):
+def save_answers(code,team,answers):
     import json
-    with conn() as c:
-        c.execute('BEGIN IMMEDIATE')
-        s=c.execute('SELECT status FROM sessions WHERE code=?',(code,)).fetchone()
-        t=c.execute('SELECT submitted FROM teams WHERE code=? AND name=?',(code,name)).fetchone()
-        if not s or s[0]!='open' or not t or t[0]:
-            c.execute('ROLLBACK'); return False
-        c.execute('UPDATE teams SET answers=?, submitted=? WHERE code=? AND name=?',(json.dumps(answer_map),int(submit),code,name))
-        c.execute('COMMIT')
-    return True
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT revealed FROM sessions WHERE code=?", (code,)).fetchone()
+        if row is None or row["revealed"]:
+            c.execute("ROLLBACK")
+            return False
+        try:
+            c.execute("INSERT INTO submissions(code,team,answers,submitted_at) VALUES(?,?,?,?)",
+                      (code,team,json.dumps(answers),time.time()))
+            c.execute("COMMIT")
+            return True
+        except sqlite3.IntegrityError:
+            c.execute("ROLLBACK")
+            return False
 
-st.title('🏆 PDTB Discourse Annotation Pair Challenge')
-st.caption('Six teams · 20 questions · PDTB discourse relations · Instructor-controlled result reveal')
-st.info('Classroom version: no instructor password. Anyone with the link can access Instructor controls. Use only in a trusted class.')
-role=st.sidebar.radio('Access', ['Team','Instructor'])
+def score(qs, answers):
+    return sum(a==q["answer"] for a,q in zip(answers,qs))
 
-if role=='Instructor':
-    st.subheader('Instructor dashboard')
-    if st.button('Create a new competition',type='primary'):
-        with conn() as c:
-            while True:
-                code='PDTB'+str(secrets.randbelow(9000)+1000)
-                try:
-                    c.execute('INSERT INTO sessions VALUES (?,?,?)',(code,'open',datetime.now(timezone.utc).isoformat()))
-                    break
-                except sqlite3.IntegrityError: pass
-        st.session_state['instructor_code']=code
-    code=st.text_input('Session code (create or paste existing)',value=st.session_state.get('instructor_code','')).strip().upper()
+def results(code, topic):
+    import json
+    qs=QUESTIONS[topic]
+    rows=[]
+    for r in all_submissions(code):
+        ans=json.loads(r["answers"])
+        rows.append({"Team":r["team"],"Correct":score(qs,ans),
+                     "Total":len(qs),"Submitted":time.strftime("%H:%M:%S",time.localtime(r["submitted_at"]))})
+    return sorted(rows,key=lambda x:(-x["Correct"],x["Submitted"],x["Team"]))
+
+st.title("📚 PDTB + UCREL Pair Challenge")
+st.caption("Choose a discourse annotation topic. Each quiz has 20 questions. Results appear only after instructor reveal.")
+role=st.radio("View",["Instructor","Team"],horizontal=True)
+
+if role=="Instructor":
+    st.subheader("Instructor dashboard")
+    topic=st.selectbox("Create a new session for",["PDTB","UCREL"])
+    if st.button("Create session",type="primary"):
+        st.session_state["instructor_code"]=create_session(topic)
+    code=st.text_input("Session code (created above or existing)",value=st.session_state.get("instructor_code","")).strip().upper()
     if code:
-        st.session_state['instructor_code']=code
-        s=session(code)
-        if not s: st.error('Session not found. Create a new competition first.')
+        s=get_session(code)
+        if not s:
+            st.error("Session not found.")
         else:
-            rows=teams(code)
-            submitted=sum(r[1] for r in rows)
-            st.metric('Teams submitted',f'{submitted}/{TEAM_LIMIT}')
-            st.write('Session code to share with teams: **'+code+'**')
-            st.write('Status: **'+s[0].upper()+'**')
-            st.dataframe(pd.DataFrame([{'Team':r[0],'Status':'Submitted' if r[1] else 'Working'} for r in rows]),hide_index=True,use_container_width=True)
-            if s[0]=='open':
-                if st.button('Reveal results',disabled=not(len(rows)==TEAM_LIMIT and submitted==TEAM_LIMIT)):
-                    with conn() as c: c.execute('UPDATE sessions SET status="revealed" WHERE code=? AND status="open"',(code,))
-                    st.rerun()
-                if st.button('Close round and reveal (unanswered = incorrect)'):
-                    with conn() as c: c.execute('UPDATE sessions SET status="revealed" WHERE code=? AND status="open"',(code,))
-                    st.rerun()
-                st.caption('Normal Reveal Results unlocks only after all six teams submit. The close-round option is for absences or incomplete teams.')
-            if s[0]=='revealed':
-                import json
-                result=sorted([{'Team':r[0],'Correct':score(json.loads(r[2])),'Total':len(QUESTIONS)} for r in rows],key=lambda x:(-x['Correct'],x['Team']))
-                st.subheader('🏅 Leaderboard')
-                st.dataframe(pd.DataFrame(result),hide_index=True,use_container_width=True)
-                st.download_button('Download results (CSV)',pd.DataFrame(result).to_csv(index=False),'pdtb_scores.csv','text/csv')
-                st.subheader('Question-by-question explanations')
-                for i,(sent,question,options,correct,explanation) in enumerate(QUESTIONS,1):
-                    with st.expander(f'Question {i}: {question}'):
-                        st.write('**Sentence:**',sent)
-                        st.success('Correct answer: '+options[correct])
-                        st.write(explanation)
-            st.button('Refresh dashboard',on_click=lambda:None)
-else:
-    st.subheader('Team participation')
-    code=st.text_input('Session code').strip().upper()
-    name=st.selectbox('Team name',[f'Team {x}' for x in 'ABCDEF'])
-    if st.button('Join or resume',type='primary'):
-        s=session(code)
-        if not s: st.error('Incorrect session code. Ask your instructor for the current code.')
-        else:
-            with conn() as c:
-                c.execute('INSERT OR IGNORE INTO teams(code,name) VALUES (?,?)',(code,name))
-            st.session_state['joined']=(code,name)
-    joined=st.session_state.get('joined')
-    if joined:
-        code,name=joined
-        s=session(code)
-        row=next((r for r in teams(code) if r[0]==name),None)
-        if not s or not row: st.error('Session or team unavailable.')
-        else:
-            import json
-            saved=json.loads(row[2]); st.write(f'**{name}** · Session **{code}**')
-            if s[0]=='revealed':
-                st.success('The instructor has revealed the results.')
-                st.metric('Your score',f'{score(saved)}/{len(QUESTIONS)}')
-                for i,(sent,question,options,correct,explanation) in enumerate(QUESTIONS):
-                    with st.expander(f'Question {i+1}: {question}'):
-                        st.write(sent)
-                        chosen=saved.get(str(i))
-                        st.write('Your answer:',options[chosen] if isinstance(chosen,int) and 0<=chosen<len(options) else 'Not answered')
-                        st.write('Correct answer:',options[correct]); st.write(explanation)
-            elif row[1]:
-                st.success('Answers submitted. Scores and explanations will appear only when the instructor reveals them.')
-                st.button('Check for revealed results',on_click=lambda:None)
-            else:
-                st.caption('Discuss answers with your teammate. No feedback is shown during the quiz.')
-                with st.form('quiz'):
-                    answers={}
-                    for i,(sent,question,options,correct,explanation) in enumerate(QUESTIONS):
-                        st.markdown(f'**Q{i+1}. {question}**')
-                        st.write(sent)
-                        current=saved.get(str(i),-1)
-                        pick=st.radio('Select an answer',range(-1,len(options)),format_func=lambda j:'— Select —' if j==-1 else options[j],index=current+1 if current>=0 else 0,key=f'ans_{code}_{name}_{i}')
-                        if pick>=0: answers[str(i)]=pick
-                    col1,col2=st.columns(2)
-                    with col1: save=st.form_submit_button('Save progress')
-                    with col2: submit=st.form_submit_button('Submit final answers',type='primary')
-                if save or submit:
-                    if store_answers(code,name,answers,submit=submit):
-                        st.success('Submitted!' if submit else 'Progress saved.')
+            st.info(f"Share code **{code}** with the teams. Topic: **{s['topic']}**.")
+            @st.fragment(run_every="4s")
+            def dashboard():
+                current=get_session(code)
+                if current is None:
+                    st.warning("Session unavailable.")
+                    return
+                submissions=all_submissions(code)
+                st.metric("Teams submitted",len(submissions))
+                st.write("Submitted teams:",", ".join(r["team"] for r in submissions) or "None yet")
+                if not current["revealed"]:
+                    st.warning("Scores and correct answers are hidden.")
+                    if st.button("Reveal results to all teams",key="reveal_"+code,type="primary"):
+                        with connect() as c:
+                            c.execute("UPDATE sessions SET revealed=1 WHERE code=?", (code,))
                         st.rerun()
-                    else: st.warning('The session is no longer accepting answers. Refresh to check results.')
+                else:
+                    st.success("Results revealed")
+                    st.dataframe(results(code,current["topic"]),hide_index=True,use_container_width=True)
+                    import csv,io
+                    buf=io.StringIO()
+                    writer=csv.DictWriter(buf,fieldnames=["Team","Correct","Total","Submitted"])
+                    writer.writeheader();writer.writerows(results(code,current["topic"]))
+                    st.download_button("Download scores (CSV)",buf.getvalue(),
+                                       file_name=f"{current['topic']}_{code}_scores.csv",mime="text/csv")
+                    with st.expander("Answer key and explanations"):
+                        for i,q in enumerate(QUESTIONS[current["topic"]],1):
+                            st.markdown(f"**{i}. {q['q']}**")
+                            st.write(f"Answer: **{q['answer']}** — {q['why']}")
+            dashboard()
+    st.caption("No instructor password is used. Anyone with the instructor session code can reveal results. Do not use this version for high-stakes examinations.")
+else:
+    st.subheader("Team quiz")
+    code=st.text_input("Enter the instructor's session code").strip().upper()
+    team=st.text_input("Team name",placeholder="e.g., Team 1").strip()
+    if code:
+        s=get_session(code)
+        if not s:
+            st.error("Incorrect session code. Ask your instructor for the code.")
+        else:
+            topic=s["topic"]
+            qs=QUESTIONS[topic]
+            st.write(f"**Topic:** {topic} · **Questions:** {len(qs)}")
+            existing={r["team"].casefold() for r in all_submissions(code)}
+            submitted=bool(team and team.casefold() in existing)
+            if submitted:
+                st.info("This team name has already submitted for this session.")
+            elif s["revealed"]:
+                st.warning("Results have been revealed; new submissions are closed.")
+            elif team:
+                with st.form("quiz_"+code+"_"+team):
+                    chosen=[]
+                    for i,q in enumerate(qs,1):
+                        st.markdown(f"**Q{i}. {q['q']}**")
+                        chosen.append(st.radio("Select one",q["options"],index=None,
+                                               key=f"{code}_{team}_{i}",label_visibility="collapsed"))
+                    send=st.form_submit_button("Submit all answers",type="primary")
+                    if send:
+                        if any(a is None for a in chosen):
+                            st.error("Please answer every question before submitting.")
+                        elif save_answers(code,team,chosen):
+                            st.success("Answers submitted. Wait for the instructor to reveal results.")
+                            st.rerun()
+                        else:
+                            st.error("Submission was not accepted (team already submitted or results revealed).")
+            @st.fragment(run_every="4s")
+            def show_results():
+                current=get_session(code)
+                if current and current["revealed"]:
+                    st.success("Instructor has revealed the results.")
+                    st.dataframe(results(code,topic),hide_index=True,use_container_width=True)
+                    with st.expander("All correct answers and explanations",expanded=True):
+                        for i,q in enumerate(qs,1):
+                            st.markdown(f"**Q{i}. {q['q']}**")
+                            st.write(f"**Correct:** {q['answer']} — {q['why']}")
+                elif submitted:
+                    st.info("Waiting for instructor reveal… This page checks automatically.")
+            show_results()
+st.divider()
+st.caption("Teaching illustrations, not official PDTB/UCREL gold annotations. Local SQLite requires one shared persistent Streamlit instance; cloud restarts may erase sessions.")
